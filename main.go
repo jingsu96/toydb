@@ -68,6 +68,8 @@ type PrepareResult int
 const (
 	PREPARE_SUCCESS PrepareResult = iota
 	PREPARE_SYNTAX_ERROR
+	PREPARE_NEGATIVE_ID
+	PREPARE_STRING_TOO_LONG
 	PREPARE_UNRECOGNIZED_STATEMENT
 )
 
@@ -168,6 +170,48 @@ func doMetaCommand(inputBuffer *InputBuffer) MetaCommandResult {
 	return META_COMMAND_UNRECOGNIZED_COMMAND
 }
 
+func prepareInsert(inputBuffer *InputBuffer, statement *Statement) PrepareResult {
+	statement.Type = STATEMENT_INSERT
+
+	tokens := strings.Fields(inputBuffer.buffer)
+
+	if len(tokens) < 4 {
+		return PREPARE_SYNTAX_ERROR
+	}
+
+	var id int
+
+	_, err := fmt.Sscanf(tokens[1], "%d", &id)
+
+	if err != nil {
+		return PREPARE_SYNTAX_ERROR
+	}
+
+	if id < 0 {
+		return PREPARE_NEGATIVE_ID
+	}
+
+	statement.RowToInsert.ID = uint32(id)
+
+	username := tokens[2]
+
+	if len(username) > COLUMN_USERNAME_SIZE {
+		return PREPARE_STRING_TOO_LONG
+	}
+
+	copy(statement.RowToInsert.Username[:], username)
+
+	email := tokens[3]
+
+    if len(email) > COLUMN_EMAIL_SIZE {
+        return PREPARE_STRING_TOO_LONG
+    }
+
+    copy(statement.RowToInsert.Email[:], email)
+
+    return PREPARE_SUCCESS
+}
+
 func prepareStatement(inputBuffer *InputBuffer, statement *Statement) PrepareResult {
 	tokens := strings.Fields(inputBuffer.buffer)
 
@@ -177,40 +221,10 @@ func prepareStatement(inputBuffer *InputBuffer, statement *Statement) PrepareRes
 
     switch tokens[0] {
     case "insert":
-        statement.Type = STATEMENT_INSERT
-
-        if len(tokens) < 4 {
-            return PREPARE_SYNTAX_ERROR
-        }
-
-        // Parse ID
-        var id int
-        _, err := fmt.Sscanf(tokens[1], "%d", &id)
-        if err != nil {
-            return PREPARE_SYNTAX_ERROR
-        }
-        statement.RowToInsert.ID = uint32(id)
-
-        // Parse Username
-        username := tokens[2]
-        if len(username) > COLUMN_USERNAME_SIZE {
-            return PREPARE_SYNTAX_ERROR
-        }
-        copy(statement.RowToInsert.Username[:], username)
-
-        // Parse Email
-        email := tokens[3]
-        if len(email) > COLUMN_EMAIL_SIZE {
-            return PREPARE_SYNTAX_ERROR
-        }
-        copy(statement.RowToInsert.Email[:], email)
-
-        return PREPARE_SUCCESS
-
+        return prepareInsert(inputBuffer, statement)
     case "select":
         statement.Type = STATEMENT_SELECT
         return PREPARE_SUCCESS
-
     default:
         return PREPARE_UNRECOGNIZED_STATEMENT
     }
@@ -248,7 +262,6 @@ func executeStatement(statement *Statement, table *Table) ExecuteResult {
     }
 }
 
-
 func main() {
 	table := NewTable()
 	reader := bufio.NewReader(os.Stdin)
@@ -278,14 +291,20 @@ func main() {
 		// Otherwise, it's a SQL statement
 		var statement Statement
 		switch prepareStatement(inputBuffer, &statement) {
-		case PREPARE_SUCCESS:
-			// Statement prepared successfully
+			case PREPARE_SUCCESS:
+			    // Statement prepared successfully
+			case PREPARE_STRING_TOO_LONG:
+			    fmt.Println("String is too long.")
+			    continue
+			case PREPARE_NEGATIVE_ID:
+			    fmt.Println("ID must be positive.")
+			    continue
 			case PREPARE_SYNTAX_ERROR:
-            fmt.Println("Syntax error. Could not parse statement.")
-            continue
-		case PREPARE_UNRECOGNIZED_STATEMENT:
-			fmt.Printf("Unrecognized keyword at start of '%s'.\n", inputBuffer.buffer)
-			continue
+			    fmt.Println("Syntax error. Could not parse statement.")
+			    continue
+			case PREPARE_UNRECOGNIZED_STATEMENT:
+			    fmt.Printf("Unrecognized keyword at start of '%s'.\n", inputBuffer.buffer)
+			    continue
 		}
 
 		result := executeStatement(&statement, table)
