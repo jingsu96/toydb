@@ -7,5 +7,8 @@ WORKDIR /app
 # Copy source code
 COPY . .
 
+RUN go format ./...
+RUN go build -o main .
+
 # Build and run the application
-CMD ["go", "run", "main.go"]
+CMD ["./main"]
