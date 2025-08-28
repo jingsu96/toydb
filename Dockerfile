@@ -5,7 +5,8 @@ FROM golang:1.21-alpine AS builder
 WORKDIR /app
 
 # Copy go.mod and go.sum files (if they exist)
-COPY go.mod go.sum ./
+COPY go.mod ./
+RUN test -f go.sum && cp go.sum . || echo "go.sum not found, continuing without it"
 
 # Download dependencies
 RUN go mod download

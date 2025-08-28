@@ -2,7 +2,9 @@ package main
 
 import (
 	"bufio"
+	"encoding/binary"
 	"fmt"
+	"io"
 	"os"
 	"strings"
 )
@@ -12,7 +14,7 @@ const (
 	COLUMN_USERNAME_SIZE = 32
 	COLUMN_EMAIL_SIZE = 255
 	PAGE_SIZE = 4096
-	TALBE_MAX_PAGES = 100
+	TABLE_MAX_PAGES = 100
 )
 
 const (
@@ -24,8 +26,15 @@ const (
 	EMAIL_OFFSET = USERNAME_OFFSET + USERNAME_SIZE
 	ROW_SIZE = ID_SIZE + USERNAME_SIZE + EMAIL_SIZE
 	ROWS_PER_PAGE = PAGE_SIZE / ROW_SIZE
-	TABLE_MAX_ROWS = ROWS_PER_PAGE * TALBE_MAX_PAGES
+	TABLE_MAX_ROWS = ROWS_PER_PAGE * TABLE_MAX_PAGES
 )
+
+// Pager handles reading/writing pages to disk
+type Pager struct {
+	FileDescriptor *os.File
+	FileLength int64
+	Pages [TABLE_MAX_PAGES][]byte
+}
 
 // Row represents a single row in our table
 type Row struct {
@@ -37,7 +46,7 @@ type Row struct {
 // Table represent our in-memory table structure
 type Table struct {
 	NumRows uint32
-	Pages [TALBE_MAX_PAGES][]byte
+	Pager *Pager
 }
 
 // StatementType represents the type of SQL statement
@@ -89,10 +98,154 @@ func NewInputBuffer() *InputBuffer {
     return &InputBuffer{}
 }
 
-func NewTable() *Table {
-	return &Table{
-		NumRows: 0,
+// pagerOpen opens the database file and initializes the pager
+func pagerOpen(filename string) (*Pager, error) {
+    // Open file with read/write permissions, create if doesn't exist
+    file, err := os.OpenFile(filename, os.O_RDWR|os.O_CREATE, 0666)
+    if err != nil {
+        return nil, fmt.Errorf("Unable to open file: %v", err)
+    }
+
+    // Get file size
+    fileInfo, err := file.Stat()
+    if err != nil {
+        file.Close()
+        return nil, fmt.Errorf("Unable to get file info: %v", err)
+    }
+
+    pager := &Pager{
+        FileDescriptor: file,
+        FileLength:     fileInfo.Size(),
+    }
+
+    // Initialize all pages to nil
+    for i := 0; i < TABLE_MAX_PAGES; i++ {
+        pager.Pages[i] = nil
+    }
+
+    return pager, nil
+}
+
+// dbOpen opens a database connection
+func dbOpen(filename string) (*Table, error) {
+    pager, err := pagerOpen(filename)
+    if err != nil {
+        return nil, err
+    }
+
+    numRows := uint32(pager.FileLength / ROW_SIZE)
+
+    table := &Table{
+        Pager:   pager,
+        NumRows: numRows,
+    }
+
+    return table, nil
+}
+
+func (p *Pager) getPage(pageNum uint32) ([]byte, error) {
+	if pageNum > TABLE_MAX_PAGES {
+		return nil, fmt.Errorf("Tried to fetch page number out of bounds, %d > %d", pageNum, TABLE_MAX_PAGES)
 	}
+
+	if p.Pages[pageNum] == nil {
+		// Cache miss, Allocate meemory and load from file
+		page := make([]byte, PAGE_SIZE)
+		numPages := p.FileLength / PAGE_SIZE
+
+		// We might have a partial page at the end of the file
+		if p.FileLength % PAGE_SIZE != 0 {
+			numPages++
+		}
+
+		if int64(pageNum) < numPages {
+			// Seek to the correct position in the file
+            _, err := p.FileDescriptor.Seek(int64(pageNum)*PAGE_SIZE, 0)
+            if err != nil {
+                return nil, fmt.Errorf("Error seeking file: %v", err)
+            }
+
+            // Read the page
+            bytesRead, err := p.FileDescriptor.Read(page)
+            if err != nil && err != io.EOF {
+                return nil, fmt.Errorf("Error reading file: %v", err)
+            }
+
+            // If we read less than a full page, that's okay
+            _ = bytesRead
+		}
+
+		p.Pages[pageNum] = page
+	}
+
+
+	return p.Pages[pageNum], nil
+}
+
+// pagerFlush writes a page to disk
+func (p *Pager) pagerFlush(pageNum uint32, size uint32) error {
+    if p.Pages[pageNum] == nil {
+        return fmt.Errorf("Tried to flush null page")
+    }
+
+    // Seek to the correct position
+    _, err := p.FileDescriptor.Seek(int64(pageNum)*PAGE_SIZE, 0)
+    if err != nil {
+        return fmt.Errorf("Error seeking: %v", err)
+    }
+
+    // Write the page
+    bytesWritten, err := p.FileDescriptor.Write(p.Pages[pageNum][:size])
+    if err != nil {
+        return fmt.Errorf("Error writing: %v", err)
+    }
+
+    if uint32(bytesWritten) != size {
+        return fmt.Errorf("Wrote %d bytes, expected %d", bytesWritten, size)
+    }
+
+    return nil
+}
+
+// dbClose flushes all pages to disk and closes the database
+func dbClose(table *Table) error {
+	pager := table.Pager
+	numFullPages := table.NumRows / ROWS_PER_PAGE
+
+	for i := uint32(0); i < numFullPages; i++ {
+		if pager.Pages[i] == nil {
+			continue
+		}
+
+		err := pager.pagerFlush(i, PAGE_SIZE)
+
+		if err != nil {
+			return err
+		}
+
+		pager.Pages[i] = nil
+	}
+
+	numAdditionalRows := table.NumRows % ROWS_PER_PAGE
+	if numAdditionalRows > 0 {
+		pageNum := numFullPages
+
+		if pager.Pages[pageNum] != nil {
+			err := pager.pagerFlush(pageNum, numAdditionalRows*ROW_SIZE)
+			if err != nil {
+				return err
+			}
+			pager.Pages[pageNum] = nil
+		}
+	}
+
+ // Close the file
+    err := pager.FileDescriptor.Close()
+    if err != nil {
+        return fmt.Errorf("Error closing db file: %v", err)
+    }
+
+    return nil
 }
 
 /**
@@ -106,37 +259,32 @@ func NewTable() *Table {
  +-------------------------------------------------------------+
  */
 func serializeRow(source *Row, destination []byte) {
-	destination[0] = byte(source.ID)
-	destination[1] = byte(source.ID >> 8)
-	destination[2] = byte(source.ID >> 16)
-	destination[3] = byte(source.ID >> 24)
+ 	binary.LittleEndian.PutUint32(destination[ID_OFFSET:], source.ID)
 
 	copy(destination[USERNAME_OFFSET:], source.Username[:])
 	copy(destination[EMAIL_OFFSET:], source.Email[:])
 }
 
 func deserializeRow(source []byte, destination *Row) {
-     destination.ID = uint32(source[0]) |
-        uint32(source[1])<<8 |
-        uint32(source[2])<<16 |
-        uint32(source[3])<<24
+    destination.ID = binary.LittleEndian.Uint32(source[ID_OFFSET:])
 
     copy(destination.Username[:], source[USERNAME_OFFSET:USERNAME_OFFSET+USERNAME_SIZE])
-
     copy(destination.Email[:], source[EMAIL_OFFSET:EMAIL_OFFSET+EMAIL_SIZE])
 }
 
-func (t *Table) rowSlot(rowNum uint32) []byte {
+func (t *Table) rowSlot(rowNum uint32) ([]byte, error) {
 	pageNum := rowNum / ROWS_PER_PAGE
 
-	if t.Pages[pageNum] == nil {
-		t.Pages[pageNum] = make([]byte, PAGE_SIZE)
+	page, err := t.Pager.getPage(pageNum)
+
+	if err != nil {
+		return nil, err
 	}
 
 	rowOffset := rowNum % ROWS_PER_PAGE
 	byteOffset := rowOffset * ROW_SIZE
 
-	return t.Pages[pageNum][byteOffset : byteOffset+ROW_SIZE]
+	return page[byteOffset : byteOffset+ROW_SIZE], nil
 }
 
 func printRow(row *Row) {
@@ -144,7 +292,6 @@ func printRow(row *Row) {
     email := strings.TrimRight(string(row.Email[:]), "\x00")
     fmt.Printf("(%d, %s, %s)\n", row.ID, username, email)
 }
-
 
 func printPrompt() {
 	fmt.Print("db > ")
@@ -161,8 +308,14 @@ func (ib *InputBuffer) readInput(reader *bufio.Reader) error {
     return nil
 }
 
-func doMetaCommand(inputBuffer *InputBuffer) MetaCommandResult {
+func doMetaCommand(inputBuffer *InputBuffer, table *Table) MetaCommandResult {
 	if inputBuffer.buffer == ".exit" {
+		err := dbClose(table)
+
+		if err != nil {
+			fmt.Printf("Error closing database %v\n", err)
+		}
+
 		fmt.Println("Bye!")
 		os.Exit(0)
 	}
@@ -236,16 +389,29 @@ func executeInsert(statement *Statement, table *Table) ExecuteResult {
 	}
 
 	rowToInsert := &statement.RowToInsert
+	slot, err := table.rowSlot(table.NumRows)
 
-	serializeRow(rowToInsert, table.rowSlot(table.NumRows))
-	table.NumRows++
-	return EXECUTE_SUCCESS
+	if err != nil {
+        fmt.Printf("Error getting row slot: %v\n", err)
+        return EXECUTE_TABLE_FULL
+    }
+
+    serializeRow(rowToInsert, slot)
+    table.NumRows++
+
+    return EXECUTE_SUCCESS
 }
 
 func executeSelect(statement *Statement, table *Table) ExecuteResult {
     var row Row
     for i := uint32(0); i < table.NumRows; i++ {
-        deserializeRow(table.rowSlot(i), &row)
+    	slot, err := table.rowSlot(i)
+
+     	if err != nil {
+      		fmt.Printf("Error getting row slot: %v\n", err)
+        	continue
+      	}
+        deserializeRow(slot, &row)
         printRow(&row)
     }
     return EXECUTE_SUCCESS
@@ -263,7 +429,17 @@ func executeStatement(statement *Statement, table *Table) ExecuteResult {
 }
 
 func main() {
-	table := NewTable()
+	if len(os.Args) < 2 {
+        fmt.Println("Must supply a database filename.")
+        os.Exit(1)
+    }
+
+    filename := os.Args[1]
+    table, err := dbOpen(filename)
+    if err != nil {
+        fmt.Printf("Error opening database: %v\n", err)
+        os.Exit(1)
+    }
 	reader := bufio.NewReader(os.Stdin)
 	inputBuffer := NewInputBuffer()
 
@@ -279,7 +455,7 @@ func main() {
 
 		// Check if it's a meta-command
 		if strings.HasPrefix(inputBuffer.buffer, ".") {
-			switch doMetaCommand(inputBuffer) {
+			switch doMetaCommand(inputBuffer, table) {
 			case META_COMMAND_SUCCESS:
 				continue
 			case META_COMMAND_UNRECOGNIZED_COMMAND:

@@ -4,6 +4,13 @@ FROM golang:1.21-alpine
 # Set working directory
 WORKDIR /app
 
+# Copy go.mod first
+COPY go.mod ./
+RUN test -f go.sum && cp go.sum . || echo "go.sum not found, continuing without it"
+
+# Download dependencies
+RUN go mod download
+
 # Copy source code
 COPY . .
 
