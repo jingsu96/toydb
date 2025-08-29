@@ -84,6 +84,7 @@ type ExecuteResult int
 
 const (
 	EXECUTE_SUCCESS ExecuteResult = iota
+	EXECUTE_DUPLICATE_KEY
 	EXECUTE_TABLE_FULL
 )
 
@@ -135,6 +136,58 @@ func tableEnd(table *Table) *Cursor {
 	cursor.EndOfTable = true
 
 	return cursor
+}
+
+func tableFind(table *Table, key uint32) (*Cursor, error) {
+	rootPageNum := table.RootPageNum
+	rootNode, err := table.Pager.getPage(rootPageNum)
+
+	if err != nil {
+		return nil, err
+	}
+
+	if btree.GetNodeType(rootNode) == btree.NODE_LEAF {
+		return leafNodeFind(table, rootPageNum, key)
+	} else {
+		return nil, fmt.Errorf("TODO: Need to implement search an internel node")
+	}
+}
+
+func leafNodeFind(table *Table, pageNum uint32, key uint32) (*Cursor, error) {
+	node, err := table.Pager.getPage(pageNum)
+
+	if err != nil {
+		return nil, err
+	}
+
+	numCells := btree.LeafNodeNumCells(node)
+
+	cursor := &Cursor {
+		Table: table,
+		PageNum: pageNum,
+	}
+
+	minIndex := uint32(0)
+	onePastMaxIndex := numCells
+
+	for onePastMaxIndex != minIndex {
+		idx := (minIndex + onePastMaxIndex) / 2
+		keyAtIndex := btree.LeafNodeKey(node, idx)
+
+		if key == keyAtIndex {
+			cursor.CellNum = idx
+			return cursor, nil
+		}
+
+		if key < keyAtIndex {
+			onePastMaxIndex = idx
+		} else {
+			minIndex = idx + 1
+		}
+	}
+
+ 	cursor.CellNum = minIndex
+    return cursor, nil
 }
 
 // cursorValue returns a slice pointing to the position described by the cursor
@@ -487,14 +540,31 @@ func executeInsert(statement *Statement, table *Table) ExecuteResult {
 		return EXECUTE_TABLE_FULL
 	}
 
-	if btree.LeafNodeNumCells(node) >= btree.LEAF_NODE_MAX_CELLS {
+	numCells := btree.LeafNodeNumCells(node)
+
+	if numCells >= btree.LEAF_NODE_MAX_CELLS {
 		return EXECUTE_TABLE_FULL
 	}
 
 	rowToInsert := &statement.RowToInsert
-	cursor := tableEnd(table)
+	keyToInsert := rowToInsert.ID
 
-	err = leafNodeInsert(cursor, rowToInsert.ID, rowToInsert)
+	// Search for the correct position
+    cursor, err := tableFind(table, keyToInsert)
+    if err != nil {
+        fmt.Printf("Error finding key: %v\n", err)
+        return EXECUTE_TABLE_FULL
+    }
+
+    // Check if key already exists
+    if cursor.CellNum < numCells {
+        keyAtIndex := btree.LeafNodeKey(node, cursor.CellNum)
+        if keyAtIndex == keyToInsert {
+            return EXECUTE_DUPLICATE_KEY
+        }
+    }
+
+	err = leafNodeInsert(cursor, keyToInsert, rowToInsert)
 	if err != nil {
 		fmt.Printf("Error inserting: %v\n", err)
 		return EXECUTE_TABLE_FULL
@@ -623,6 +693,8 @@ func main() {
 		switch result {
 		case EXECUTE_SUCCESS:
 			fmt.Println("Executed.")
+			case EXECUTE_DUPLICATE_KEY:
+    fmt.Println("Error: Duplicate key.")
 		case EXECUTE_TABLE_FULL:
 			fmt.Println("Error: Table full.")
 		}
