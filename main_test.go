@@ -17,9 +17,10 @@ func runScript(commands []string) ([]string, error) {
 		return nil, err
 	}
 	defer os.Remove("testdb") // Clean up after test
+	defer os.Remove("test.db") // Clean up database file
 
-	// Run the database
-	cmd := exec.Command("./testdb")
+	// Run the database with a temporary filename
+	cmd := exec.Command("./testdb", "test.db")
 
 	// Create pipes for stdin and stdout
 	stdin, err := cmd.StdinPipe()

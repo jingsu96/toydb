@@ -7,31 +7,21 @@ import (
 	"io"
 	"os"
 	"strings"
+	"toydb/btree"
+	"toydb/constants"
 )
 
 // hardcoded DB
 const (
-	COLUMN_USERNAME_SIZE = 32
-	COLUMN_EMAIL_SIZE    = 255
-	PAGE_SIZE            = 4096
-	TABLE_MAX_PAGES      = 100
-)
-
-const (
-	ID_SIZE         = 4 // size of uint32
-	USERNAME_SIZE   = COLUMN_USERNAME_SIZE
-	EMAIL_SIZE      = COLUMN_EMAIL_SIZE
 	ID_OFFSET       = 0
-	USERNAME_OFFSET = ID_OFFSET + ID_SIZE
-	EMAIL_OFFSET    = USERNAME_OFFSET + USERNAME_SIZE
-	ROW_SIZE        = ID_SIZE + USERNAME_SIZE + EMAIL_SIZE
-	ROWS_PER_PAGE   = PAGE_SIZE / ROW_SIZE
-	TABLE_MAX_ROWS  = ROWS_PER_PAGE * TABLE_MAX_PAGES
+	USERNAME_OFFSET = ID_OFFSET + constants.ID_SIZE
+	EMAIL_OFFSET    = USERNAME_OFFSET + constants.COLUMN_USERNAME_SIZE
 )
 
 type Cursor struct {
 	Table      *Table
-	RowNum     uint32
+	PageNum    uint32
+	CellNum    uint32
 	EndOfTable bool // Indicates a position one past the last element
 }
 
@@ -39,20 +29,21 @@ type Cursor struct {
 type Pager struct {
 	FileDescriptor *os.File
 	FileLength     int64
-	Pages          [TABLE_MAX_PAGES][]byte
+	NumPages       uint32
+	Pages          [constants.TABLE_MAX_PAGES][]byte
 }
 
 // Row represents a single row in our table
 type Row struct {
 	ID       uint32
-	Username [COLUMN_USERNAME_SIZE]byte
-	Email    [COLUMN_EMAIL_SIZE]byte
+	Username [constants.COLUMN_USERNAME_SIZE]byte
+	Email    [constants.COLUMN_EMAIL_SIZE]byte
 }
 
 // Table represent our in-memory table structure
 type Table struct {
-	NumRows uint32
-	Pager   *Pager
+	RootPageNum uint32
+	Pager       *Pager
 }
 
 // StatementType represents the type of SQL statement
@@ -105,49 +96,71 @@ func NewInputBuffer() *InputBuffer {
 }
 
 // tableStart creates a cursor at the beginning of the table
-func tableStart(table *Table) *Cursor {
+func tableStart(table *Table) (*Cursor, error) {
 	cursor := &Cursor{
-		Table:      table,
-		RowNum:     0,
-		EndOfTable: (table.NumRows == 0),
+		Table:   table,
+		CellNum: 0,
+		PageNum: table.RootPageNum,
 	}
 
-	return cursor
+	rootNode, err := table.Pager.getPage(table.RootPageNum)
+
+	if err != nil {
+		return nil, err
+	}
+
+	numCells := btree.LeafNodeNumCells(rootNode)
+	cursor.EndOfTable = numCells == 0
+
+	return cursor, nil
 }
 
 // tableEnd creates a cursor past the end of the table
 func tableEnd(table *Table) *Cursor {
 	cursor := &Cursor{
-		Table:      table,
-		RowNum:     table.NumRows,
-		EndOfTable: true,
+		Table:   table,
+		PageNum: table.RootPageNum,
 	}
+
+	rootNode, err := table.Pager.getPage(table.RootPageNum)
+	if err != nil {
+		// For simplicity, just return the cursor without error handling
+		// In a real implementation, you might want to handle this differently
+		cursor.EndOfTable = true
+		return cursor
+	}
+
+	numCells := btree.LeafNodeNumCells(rootNode)
+	cursor.CellNum = numCells
+	cursor.EndOfTable = true
 
 	return cursor
 }
 
 // cursorValue returns a slice pointing to the position described by the cursor
 func cursorValue(cursor *Cursor) ([]byte, error) {
-	rowNum := cursor.RowNum
-	pageNum := rowNum / ROWS_PER_PAGE
-
-	page, err := cursor.Table.Pager.getPage(pageNum)
+	page, err := cursor.Table.Pager.getPage(cursor.PageNum)
 	if err != nil {
 		return nil, err
 	}
 
-	rowOffset := rowNum % ROWS_PER_PAGE
-	byteOffset := rowOffset * ROW_SIZE
-
-	return page[byteOffset : byteOffset+ROW_SIZE], nil
+	return btree.LeafNodeValue(page, cursor.CellNum), nil
 }
 
 // cursorAdvance moves the cursor to the next row
-func cursorAdvance(cursor *Cursor) {
-	cursor.RowNum++
-	if cursor.RowNum >= cursor.Table.NumRows {
+func cursorAdvance(cursor *Cursor) error {
+	pageNum := cursor.PageNum
+	node, err := cursor.Table.Pager.getPage(pageNum)
+	if err != nil {
+		return err
+	}
+
+	cursor.CellNum++
+	if cursor.CellNum >= btree.LeafNodeNumCells(node) {
 		cursor.EndOfTable = true
 	}
+
+	return nil
 }
 
 // pagerOpen opens the database file and initializes the pager
@@ -165,13 +178,22 @@ func pagerOpen(filename string) (*Pager, error) {
 		return nil, fmt.Errorf("Unable to get file info: %v", err)
 	}
 
+	fileLength := fileInfo.Size()
+	numPages := uint32(fileLength / constants.PAGE_SIZE)
+
+	if fileLength%constants.PAGE_SIZE != 0 {
+		file.Close()
+		return nil, fmt.Errorf("Db file is not a whole number of pages. Corrupt file.")
+	}
+
 	pager := &Pager{
 		FileDescriptor: file,
-		FileLength:     fileInfo.Size(),
+		FileLength:     fileLength,
+		NumPages:       numPages,
 	}
 
 	// Initialize all pages to nil
-	for i := 0; i < TABLE_MAX_PAGES; i++ {
+	for i := 0; i < constants.TABLE_MAX_PAGES; i++ {
 		pager.Pages[i] = nil
 	}
 
@@ -185,34 +207,41 @@ func dbOpen(filename string) (*Table, error) {
 		return nil, err
 	}
 
-	numRows := uint32(pager.FileLength / ROW_SIZE)
-
 	table := &Table{
-		Pager:   pager,
-		NumRows: numRows,
+		Pager:       pager,
+		RootPageNum: 0,
+	}
+
+	if pager.NumPages == 0 {
+		rootNode, err := pager.getPage(0)
+		if err != nil {
+			return nil, err
+		}
+
+		btree.InitializeLeafNode(rootNode)
 	}
 
 	return table, nil
 }
 
 func (p *Pager) getPage(pageNum uint32) ([]byte, error) {
-	if pageNum > TABLE_MAX_PAGES {
-		return nil, fmt.Errorf("Tried to fetch page number out of bounds, %d > %d", pageNum, TABLE_MAX_PAGES)
+	if pageNum > constants.TABLE_MAX_PAGES {
+		return nil, fmt.Errorf("Tried to fetch page number out of bounds, %d > %d", pageNum, constants.TABLE_MAX_PAGES)
 	}
 
 	if p.Pages[pageNum] == nil {
 		// Cache miss, Allocate meemory and load from file
-		page := make([]byte, PAGE_SIZE)
-		numPages := p.FileLength / PAGE_SIZE
+		page := make([]byte, constants.PAGE_SIZE)
+		numPages := p.FileLength / constants.PAGE_SIZE
 
 		// We might have a partial page at the end of the file
-		if p.FileLength%PAGE_SIZE != 0 {
+		if p.FileLength%constants.PAGE_SIZE != 0 {
 			numPages++
 		}
 
 		if int64(pageNum) < numPages {
 			// Seek to the correct position in the file
-			_, err := p.FileDescriptor.Seek(int64(pageNum)*PAGE_SIZE, 0)
+			_, err := p.FileDescriptor.Seek(int64(pageNum)*constants.PAGE_SIZE, 0)
 			if err != nil {
 				return nil, fmt.Errorf("Error seeking file: %v", err)
 			}
@@ -228,6 +257,10 @@ func (p *Pager) getPage(pageNum uint32) ([]byte, error) {
 		}
 
 		p.Pages[pageNum] = page
+
+		if pageNum >= p.NumPages {
+			p.NumPages = pageNum + 1
+		}
 	}
 
 	return p.Pages[pageNum], nil
@@ -240,7 +273,7 @@ func (p *Pager) pagerFlush(pageNum uint32, size uint32) error {
 	}
 
 	// Seek to the correct position
-	_, err := p.FileDescriptor.Seek(int64(pageNum)*PAGE_SIZE, 0)
+	_, err := p.FileDescriptor.Seek(int64(pageNum)*constants.PAGE_SIZE, 0)
 	if err != nil {
 		return fmt.Errorf("Error seeking: %v", err)
 	}
@@ -261,15 +294,14 @@ func (p *Pager) pagerFlush(pageNum uint32, size uint32) error {
 // dbClose flushes all pages to disk and closes the database
 func dbClose(table *Table) error {
 	pager := table.Pager
-	numFullPages := table.NumRows / ROWS_PER_PAGE
 
-	for i := uint32(0); i < numFullPages; i++ {
+	// Flush all pages that are in memory
+	for i := uint32(0); i < pager.NumPages; i++ {
 		if pager.Pages[i] == nil {
 			continue
 		}
 
-		err := pager.pagerFlush(i, PAGE_SIZE)
-
+		err := pager.pagerFlush(i, constants.PAGE_SIZE)
 		if err != nil {
 			return err
 		}
@@ -277,24 +309,39 @@ func dbClose(table *Table) error {
 		pager.Pages[i] = nil
 	}
 
-	numAdditionalRows := table.NumRows % ROWS_PER_PAGE
-	if numAdditionalRows > 0 {
-		pageNum := numFullPages
-
-		if pager.Pages[pageNum] != nil {
-			err := pager.pagerFlush(pageNum, numAdditionalRows*ROW_SIZE)
-			if err != nil {
-				return err
-			}
-			pager.Pages[pageNum] = nil
-		}
-	}
-
 	// Close the file
 	err := pager.FileDescriptor.Close()
 	if err != nil {
 		return fmt.Errorf("Error closing db file: %v", err)
 	}
+
+	return nil
+}
+
+func leafNodeInsert(cursor *Cursor, key uint32, value *Row) error {
+	node, err := cursor.Table.Pager.getPage(cursor.PageNum)
+	if err != nil {
+		return err
+	}
+
+	numCells := btree.LeafNodeNumCells(node)
+	if numCells >= btree.LEAF_NODE_MAX_CELLS {
+		// Node full
+		return fmt.Errorf("Need to implement splitting a leaf node.")
+	}
+
+	if cursor.CellNum < numCells {
+		// Make room for new cell
+		for i := numCells; i > cursor.CellNum; i-- {
+			destCell := btree.LeafNodeCell(node, i)
+			srcCell := btree.LeafNodeCell(node, i-1)
+			copy(destCell, srcCell)
+		}
+	}
+
+	btree.SetLeafNodeNumCells(node, numCells+1)
+	btree.SetLeafNodeKey(node, cursor.CellNum, key)
+	serializeRow(value, btree.LeafNodeValue(node, cursor.CellNum))
 
 	return nil
 }
@@ -320,8 +367,8 @@ func serializeRow(source *Row, destination []byte) {
 func deserializeRow(source []byte, destination *Row) {
 	destination.ID = binary.LittleEndian.Uint32(source[ID_OFFSET:])
 
-	copy(destination.Username[:], source[USERNAME_OFFSET:USERNAME_OFFSET+USERNAME_SIZE])
-	copy(destination.Email[:], source[EMAIL_OFFSET:EMAIL_OFFSET+EMAIL_SIZE])
+	copy(destination.Username[:], source[USERNAME_OFFSET:USERNAME_OFFSET+constants.COLUMN_USERNAME_SIZE])
+	copy(destination.Email[:], source[EMAIL_OFFSET:EMAIL_OFFSET+constants.COLUMN_EMAIL_SIZE])
 }
 
 func printRow(row *Row) {
@@ -346,18 +393,31 @@ func (ib *InputBuffer) readInput(reader *bufio.Reader) error {
 }
 
 func doMetaCommand(inputBuffer *InputBuffer, table *Table) MetaCommandResult {
-	if inputBuffer.buffer == ".exit" {
+	switch inputBuffer.buffer {
+	case ".exit":
 		err := dbClose(table)
-
 		if err != nil {
-			fmt.Printf("Error closing database %v\n", err)
+			fmt.Printf("Error closing database: %v\n", err)
 		}
-
 		fmt.Println("Bye!")
 		os.Exit(0)
+		return META_COMMAND_UNRECOGNIZED_COMMAND
+	case ".btree":
+		fmt.Println("Tree:")
+		node, err := table.Pager.getPage(0)
+		if err != nil {
+			fmt.Printf("Error getting page: %v\n", err)
+		} else {
+			printLeafNode(node)
+		}
+		return META_COMMAND_SUCCESS
+	case ".constants":
+		fmt.Println("Constants:")
+		printConstants()
+		return META_COMMAND_SUCCESS
+	default:
+		return META_COMMAND_UNRECOGNIZED_COMMAND
 	}
-
-	return META_COMMAND_UNRECOGNIZED_COMMAND
 }
 
 func prepareInsert(inputBuffer *InputBuffer, statement *Statement) PrepareResult {
@@ -385,7 +445,7 @@ func prepareInsert(inputBuffer *InputBuffer, statement *Statement) PrepareResult
 
 	username := tokens[2]
 
-	if len(username) > COLUMN_USERNAME_SIZE {
+	if len(username) > constants.COLUMN_USERNAME_SIZE {
 		return PREPARE_STRING_TOO_LONG
 	}
 
@@ -393,7 +453,7 @@ func prepareInsert(inputBuffer *InputBuffer, statement *Statement) PrepareResult
 
 	email := tokens[3]
 
-	if len(email) > COLUMN_EMAIL_SIZE {
+	if len(email) > constants.COLUMN_EMAIL_SIZE {
 		return PREPARE_STRING_TOO_LONG
 	}
 
@@ -421,41 +481,54 @@ func prepareStatement(inputBuffer *InputBuffer, statement *Statement) PrepareRes
 }
 
 func executeInsert(statement *Statement, table *Table) ExecuteResult {
-	if table.NumRows >= TABLE_MAX_ROWS {
+	node, err := table.Pager.getPage(table.RootPageNum)
+	if err != nil {
+		fmt.Printf("Error getting root page: %v\n", err)
+		return EXECUTE_TABLE_FULL
+	}
+
+	if btree.LeafNodeNumCells(node) >= btree.LEAF_NODE_MAX_CELLS {
 		return EXECUTE_TABLE_FULL
 	}
 
 	rowToInsert := &statement.RowToInsert
 	cursor := tableEnd(table)
-	slot, err := cursorValue(cursor)
 
+	err = leafNodeInsert(cursor, rowToInsert.ID, rowToInsert)
 	if err != nil {
-		fmt.Printf("Error getting row slot: %v\n", err)
+		fmt.Printf("Error inserting: %v\n", err)
 		return EXECUTE_TABLE_FULL
 	}
-
-	serializeRow(rowToInsert, slot)
-	table.NumRows++
 
 	return EXECUTE_SUCCESS
 }
 
 func executeSelect(statement *Statement, table *Table) ExecuteResult {
-	cursor := tableStart(table)
+	cursor, err := tableStart(table)
+	if err != nil {
+		fmt.Printf("Error getting cursor: %v\n", err)
+		return EXECUTE_SUCCESS
+	}
 
 	var row Row
-
 	for !cursor.EndOfTable {
 		slot, err := cursorValue(cursor)
 		if err != nil {
 			fmt.Printf("Error getting cursor value: %v\n", err)
-			cursorAdvance(cursor)
+			cursor.EndOfTable = true
 			continue
 		}
+
 		deserializeRow(slot, &row)
 		printRow(&row)
-		cursorAdvance(cursor)
+
+		err = cursorAdvance(cursor)
+		if err != nil {
+			fmt.Printf("Error advancing cursor: %v\n", err)
+			cursor.EndOfTable = true
+		}
 	}
+
 	return EXECUTE_SUCCESS
 }
 
@@ -467,6 +540,27 @@ func executeStatement(statement *Statement, table *Table) ExecuteResult {
 		return executeSelect(statement, table)
 	default:
 		return EXECUTE_SUCCESS
+	}
+}
+
+// =========
+// DEBUG
+// =========
+func printConstants() {
+	fmt.Printf("ROW_SIZE: %d\n", constants.ROW_SIZE)
+	fmt.Printf("COMMON_NODE_HEADER_SIZE: %d\n", btree.COMMON_NODE_HEADER_SIZE)
+	fmt.Printf("LEAF_NODE_HEADER_SIZE: %d\n", btree.LEAF_NODE_HEADER_SIZE)
+	fmt.Printf("LEAF_NODE_CELL_SIZE: %d\n", btree.LEAF_NODE_CELL_SIZE)
+	fmt.Printf("LEAF_NODE_SPACE_FOR_CELLS: %d\n", btree.LEAF_NODE_SPACE_FOR_CELLS)
+	fmt.Printf("LEAF_NODE_MAX_CELLS: %d\n", btree.LEAF_NODE_MAX_CELLS)
+}
+
+func printLeafNode(node []byte) {
+	numCells := btree.LeafNodeNumCells(node)
+	fmt.Printf("leaf (size %d)\n", numCells)
+	for i := uint32(0); i < numCells; i++ {
+		key := btree.LeafNodeKey(node, i)
+		fmt.Printf("  - %d : %d\n", i, key)
 	}
 }
 
