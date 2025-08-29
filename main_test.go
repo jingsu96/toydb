@@ -16,7 +16,7 @@ func runScript(commands []string) ([]string, error) {
 	if err := buildCmd.Run(); err != nil {
 		return nil, err
 	}
-	defer os.Remove("testdb") // Clean up after test
+	defer os.Remove("testdb")  // Clean up after test
 	defer os.Remove("test.db") // Clean up database file
 
 	// Run the database with a temporary filename
