@@ -153,6 +153,73 @@ func tableFind(table *Table, key uint32) (*Cursor, error) {
 	}
 }
 
+// getUnusedPageNum returns the next available page number
+func getUnusedPageNum(pager *Pager) uint32 {
+	// For now, we just append to the end of the file
+	return pager.NumPages
+}
+
+// getNodeMaxKey returns the max key in a node
+func getNodeMaxKey(node []byte) uint32 {
+	switch btree.GetNodeType(node) {
+	case btree.NODE_INTERNAL:
+		numKeys := btree.InternalNodeNumKeys(node)
+		return btree.InternalNodeKey(node, numKeys-1)
+	case btree.NODE_LEAF:
+		numCells := btree.LeafNodeNumCells(node)
+		return btree.LeafNodeKey(node, numCells-1)
+	default:
+		panic("Unknown node type")
+	}
+}
+
+func createNewRoot(table *Table, rightChildPageNum uint32) error {
+	root, err := table.Pager.getPage(table.RootPageNum)
+	if err != nil {
+		return err
+	}
+
+	rightChild, err := table.Pager.getPage(rightChildPageNum)
+	if err != nil {
+		return err
+	}
+
+	leftChildPageNum := getUnusedPageNum(table.Pager)
+	leftChild, err := table.Pager.getPage(leftChildPageNum)
+	if err != nil {
+		return err
+	}
+
+	// Left child has data copied from old root
+	copy(leftChild, root)
+	btree.SetNodeRoot(leftChild, false)
+
+	// Root node is a new internal node with one key and two children
+	btree.InitializeInternalNode(root)
+	btree.SetNodeRoot(root, true)
+	btree.SetInternalNodeNumKeys(root, 1)
+	btree.SetInternalNodeChild(root, 0, leftChildPageNum)
+
+	leftChildMaxKey := getNodeMaxKey(leftChild)
+	btree.SetInternalNodeKey(root, 0, leftChildMaxKey)
+	btree.SetInternalNodeRightChild(root, rightChildPageNum)
+
+	// Update parent pointers
+	setNodeParent(leftChild, table.RootPageNum)
+	setNodeParent(rightChild, table.RootPageNum)
+
+	return nil
+}
+
+// Node parent functions (we'll use these later)
+func nodeParent(node []byte) uint32 {
+	return binary.LittleEndian.Uint32(node[btree.PARENT_POINTER_OFFSET:])
+}
+
+func setNodeParent(node []byte, parent uint32) {
+	binary.LittleEndian.PutUint32(node[btree.PARENT_POINTER_OFFSET:], parent)
+}
+
 func leafNodeFind(table *Table, pageNum uint32, key uint32) (*Cursor, error) {
 	node, err := table.Pager.getPage(pageNum)
 
@@ -371,6 +438,62 @@ func dbClose(table *Table) error {
 	return nil
 }
 
+func leafNodeSplitAndInsert(cursor *Cursor, key uint32, value *Row) error {
+	oldNode, err := cursor.Table.Pager.getPage(cursor.PageNum)
+	if err != nil {
+		return err
+	}
+
+	newPageNum := getUnusedPageNum(cursor.Table.Pager)
+	newNode, err := cursor.Table.Pager.getPage(newPageNum)
+	if err != nil {
+		return err
+	}
+
+	btree.InitializeLeafNode(newNode)
+	setNodeParent(newNode, nodeParent(oldNode))
+
+	// All existing keys plus new key should be divided
+	// evenly between old (left) and new (right) nodes.
+	// Starting from the right, move each key to correct position.
+	for i := int32(btree.LEAF_NODE_MAX_CELLS); i >= 0; i-- {
+		var destinationNode []byte
+		if i >= int32(btree.LEAF_NODE_LEFT_SPLIT_COUNT) {
+			destinationNode = newNode
+		} else {
+			destinationNode = oldNode
+		}
+
+		indexWithinNode := uint32(i % int32(btree.LEAF_NODE_LEFT_SPLIT_COUNT))
+		destination := btree.LeafNodeCell(destinationNode, indexWithinNode)
+
+		if i == int32(cursor.CellNum) {
+			// This is where the new cell goes
+			btree.SetLeafNodeKey(destinationNode, indexWithinNode, key)
+			serializeRow(value, btree.LeafNodeValue(destinationNode, indexWithinNode))
+		} else if i > int32(cursor.CellNum) {
+			// Move existing cell
+			source := btree.LeafNodeCell(oldNode, uint32(i-1))
+			copy(destination, source)
+		} else {
+			// Move existing cell
+			source := btree.LeafNodeCell(oldNode, uint32(i))
+			copy(destination, source)
+		}
+	}
+
+	// Update cell counts
+	btree.SetLeafNodeNumCells(oldNode, btree.LEAF_NODE_LEFT_SPLIT_COUNT)
+	btree.SetLeafNodeNumCells(newNode, btree.LEAF_NODE_RIGHT_SPLIT_COUNT)
+
+	if btree.IsNodeRoot(oldNode) {
+		return createNewRoot(cursor.Table, newPageNum)
+	} else {
+		// We'll implement this in a later part
+		return fmt.Errorf("Need to implement updating parent after split")
+	}
+}
+
 func leafNodeInsert(cursor *Cursor, key uint32, value *Row) error {
 	node, err := cursor.Table.Pager.getPage(cursor.PageNum)
 	if err != nil {
@@ -379,8 +502,8 @@ func leafNodeInsert(cursor *Cursor, key uint32, value *Row) error {
 
 	numCells := btree.LeafNodeNumCells(node)
 	if numCells >= btree.LEAF_NODE_MAX_CELLS {
-		// Node full
-		return fmt.Errorf("Need to implement splitting a leaf node.")
+		// Node full - split it
+		return leafNodeSplitAndInsert(cursor, key, value)
 	}
 
 	if cursor.CellNum < numCells {
@@ -457,11 +580,9 @@ func doMetaCommand(inputBuffer *InputBuffer, table *Table) MetaCommandResult {
 		return META_COMMAND_UNRECOGNIZED_COMMAND
 	case ".btree":
 		fmt.Println("Tree:")
-		node, err := table.Pager.getPage(0)
+		err := printTree(table.Pager, 0, 0)
 		if err != nil {
-			fmt.Printf("Error getting page: %v\n", err)
-		} else {
-			printLeafNode(node)
+			fmt.Printf("Error printing tree: %v\n", err)
 		}
 		return META_COMMAND_SUCCESS
 	case ".constants":
@@ -542,21 +663,15 @@ func executeInsert(statement *Statement, table *Table) ExecuteResult {
 
 	numCells := btree.LeafNodeNumCells(node)
 
-	if numCells >= btree.LEAF_NODE_MAX_CELLS {
-		return EXECUTE_TABLE_FULL
-	}
-
 	rowToInsert := &statement.RowToInsert
 	keyToInsert := rowToInsert.ID
 
-	// Search for the correct position
 	cursor, err := tableFind(table, keyToInsert)
 	if err != nil {
 		fmt.Printf("Error finding key: %v\n", err)
 		return EXECUTE_TABLE_FULL
 	}
 
-	// Check if key already exists
 	if cursor.CellNum < numCells {
 		keyAtIndex := btree.LeafNodeKey(node, cursor.CellNum)
 		if keyAtIndex == keyToInsert {
@@ -564,7 +679,7 @@ func executeInsert(statement *Statement, table *Table) ExecuteResult {
 		}
 	}
 
-	err = leafNodeInsert(cursor, keyToInsert, rowToInsert)
+	err = leafNodeInsert(cursor, rowToInsert.ID, rowToInsert)
 	if err != nil {
 		fmt.Printf("Error inserting: %v\n", err)
 		return EXECUTE_TABLE_FULL
@@ -625,13 +740,51 @@ func printConstants() {
 	fmt.Printf("LEAF_NODE_MAX_CELLS: %d\n", btree.LEAF_NODE_MAX_CELLS)
 }
 
-func printLeafNode(node []byte) {
-	numCells := btree.LeafNodeNumCells(node)
-	fmt.Printf("leaf (size %d)\n", numCells)
-	for i := uint32(0); i < numCells; i++ {
-		key := btree.LeafNodeKey(node, i)
-		fmt.Printf("  - %d : %d\n", i, key)
+func indent(level uint32) {
+	for i := uint32(0); i < level; i++ {
+		fmt.Print("  ")
 	}
+}
+
+func printTree(pager *Pager, pageNum uint32, indentationLevel uint32) error {
+	node, err := pager.getPage(pageNum)
+	if err != nil {
+		return err
+	}
+
+	switch btree.GetNodeType(node) {
+	case btree.NODE_LEAF:
+		numCells := btree.LeafNodeNumCells(node)
+		indent(indentationLevel)
+		fmt.Printf("- leaf (size %d)\n", numCells)
+		for i := uint32(0); i < numCells; i++ {
+			indent(indentationLevel + 1)
+			fmt.Printf("  - key %d\n", btree.LeafNodeKey(node, i))
+		}
+
+	case btree.NODE_INTERNAL:
+		numKeys := btree.InternalNodeNumKeys(node)
+		indent(indentationLevel)
+		fmt.Printf("- internal (size %d)\n", numKeys)
+		for i := uint32(0); i < numKeys; i++ {
+			child := btree.InternalNodeChild(node, i)
+			err = printTree(pager, child, indentationLevel+1)
+			if err != nil {
+				return err
+			}
+
+			indent(indentationLevel + 1)
+			fmt.Printf("- key %d\n", btree.InternalNodeKey(node, i))
+		}
+
+		rightChild := btree.InternalNodeRightChild(node)
+		err = printTree(pager, rightChild, indentationLevel+1)
+		if err != nil {
+			return err
+		}
+	}
+
+	return nil
 }
 
 func main() {
