@@ -116,28 +116,6 @@ func tableStart(table *Table) (*Cursor, error) {
 	return cursor, nil
 }
 
-// tableEnd creates a cursor past the end of the table
-func tableEnd(table *Table) *Cursor {
-	cursor := &Cursor{
-		Table:   table,
-		PageNum: table.RootPageNum,
-	}
-
-	rootNode, err := table.Pager.getPage(table.RootPageNum)
-	if err != nil {
-		// For simplicity, just return the cursor without error handling
-		// In a real implementation, you might want to handle this differently
-		cursor.EndOfTable = true
-		return cursor
-	}
-
-	numCells := btree.LeafNodeNumCells(rootNode)
-	cursor.CellNum = numCells
-	cursor.EndOfTable = true
-
-	return cursor
-}
-
 func tableFind(table *Table, key uint32) (*Cursor, error) {
 	rootPageNum := table.RootPageNum
 	rootNode, err := table.Pager.getPage(rootPageNum)
@@ -524,17 +502,6 @@ func leafNodeInsert(cursor *Cursor, key uint32, value *Row) error {
 	return nil
 }
 
-/*
-*
-  - +-------------------------------------------------------------+
-    |      (byte(ID), byte(ID>>8), byte(ID>>16), byte(ID>>24))     |
-    |   +---------------------------------------------------------+
-    |   | 0x01 | 0x02 | 0x03 | 0x04 | ..... (Array)               |
-    |   +---------------------------------------------------------+
-    |     Array:                                                |
-    |     `destination`  ->  [0, 1, 2, 3, 4, 5, 6, 7, ..., N]     |
-    +-------------------------------------------------------------+
-*/
 func serializeRow(source *Row, destination []byte) {
 	binary.LittleEndian.PutUint32(destination[ID_OFFSET:], source.ID)
 
