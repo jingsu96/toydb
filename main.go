@@ -98,22 +98,33 @@ func NewInputBuffer() *InputBuffer {
 
 // tableStart creates a cursor at the beginning of the table
 func tableStart(table *Table) (*Cursor, error) {
-	cursor := &Cursor{
-		Table:   table,
-		CellNum: 0,
-		PageNum: table.RootPageNum,
-	}
+    rootPageNum := table.RootPageNum
 
-	rootNode, err := table.Pager.getPage(table.RootPageNum)
+    // Find the leftmost leaf node
+    pageNum := rootPageNum
+    for {
+        node, err := table.Pager.getPage(pageNum)
+        if err != nil {
+            return nil, err
+        }
 
-	if err != nil {
-		return nil, err
-	}
+        if btree.GetNodeType(node) == btree.NODE_LEAF {
+            // Found a leaf node
+            cursor := &Cursor{
+                Table:   table,
+                CellNum: 0,
+                PageNum: pageNum,
+            }
 
-	numCells := btree.LeafNodeNumCells(rootNode)
-	cursor.EndOfTable = numCells == 0
+            numCells := btree.LeafNodeNumCells(node)
+            cursor.EndOfTable = numCells == 0
 
-	return cursor, nil
+            return cursor, nil
+        }
+
+        // It's an internal node, go to the leftmost child
+        pageNum = btree.InternalNodeChild(node, 0)
+    }
 }
 
 func tableFind(table *Table, key uint32) (*Cursor, error) {
@@ -127,8 +138,48 @@ func tableFind(table *Table, key uint32) (*Cursor, error) {
 	if btree.GetNodeType(rootNode) == btree.NODE_LEAF {
 		return leafNodeFind(table, rootPageNum, key)
 	} else {
-		return nil, fmt.Errorf("TODO: Need to implement search an internal node")
+		return internalNodeFind(table, rootPageNum, key)
 	}
+}
+
+func internalNodeFind(table *Table, pageNum uint32, key uint32) (*Cursor, error) {
+	node, err := table.Pager.getPage(pageNum)
+
+	if err != nil {
+		return nil, err
+	}
+
+	numKeys := btree.InternalNodeNumKeys(node)
+
+	minIdx := uint32(0)
+	maxIdx := numKeys
+
+	for minIdx != maxIdx {
+		idx := (minIdx + maxIdx) / 2
+		keyToRight := btree.InternalNodeKey(node, idx)
+		if keyToRight >= key {
+			maxIdx = idx
+		} else {
+			minIdx = idx + 1
+		}
+	}
+
+	childNum := btree.InternalNodeChild(node, minIdx)
+	child, err := table.Pager.getPage(childNum)
+
+	if err != nil {
+		return nil, err
+	}
+
+	// Recursively search the child
+    switch btree.GetNodeType(child) {
+    case btree.NODE_LEAF:
+        return leafNodeFind(table, childNum, key)
+    case btree.NODE_INTERNAL:
+        return internalNodeFind(table, childNum, key)
+    default:
+        return nil, fmt.Errorf("Unknown node type")
+    }
 }
 
 // getUnusedPageNum returns the next available page number
@@ -246,19 +297,29 @@ func cursorValue(cursor *Cursor) ([]byte, error) {
 }
 
 // cursorAdvance moves the cursor to the next row
+// cursorAdvance moves the cursor to the next row
 func cursorAdvance(cursor *Cursor) error {
-	pageNum := cursor.PageNum
-	node, err := cursor.Table.Pager.getPage(pageNum)
-	if err != nil {
-		return err
-	}
+    pageNum := cursor.PageNum
+    node, err := cursor.Table.Pager.getPage(pageNum)
+    if err != nil {
+        return err
+    }
 
-	cursor.CellNum++
-	if cursor.CellNum >= btree.LeafNodeNumCells(node) {
-		cursor.EndOfTable = true
-	}
+    cursor.CellNum++
+    if cursor.CellNum >= btree.LeafNodeNumCells(node) {
+        // We've reached the end of this leaf node
+        // Move to the next leaf node
+        nextLeaf := btree.LeafNodeNextLeaf(node)
+        if nextLeaf == 0 {
+            // No more leaf nodes
+            cursor.EndOfTable = true
+        } else {
+            cursor.PageNum = nextLeaf
+            cursor.CellNum = 0
+        }
+    }
 
-	return nil
+    return nil
 }
 
 // pagerOpen opens the database file and initializes the pager
@@ -431,7 +492,12 @@ func leafNodeSplitAndInsert(cursor *Cursor, key uint32, value *Row) error {
 	}
 
 	btree.InitializeLeafNode(newNode)
-	setNodeParent(newNode, nodeParent(oldNode))
+    setNodeParent(newNode, nodeParent(oldNode))
+
+    // Maintain the linked list of leaf nodes
+    nextLeaf := btree.LeafNodeNextLeaf(oldNode)
+    btree.SetLeafNodeNextLeaf(oldNode, newPageNum)
+    btree.SetLeafNodeNextLeaf(newNode, nextLeaf)
 
 	// All existing keys plus new key should be divided
 	// evenly between old (left) and new (right) nodes.

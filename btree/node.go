@@ -50,9 +50,11 @@ const (
 
 // Leaf Node Header Layout
 const (
-	LEAF_NODE_NUM_CELLS_SIZE   = 4 // size of uint32
-	LEAF_NODE_NUM_CELLS_OFFSET = COMMON_NODE_HEADER_SIZE
-	LEAF_NODE_HEADER_SIZE      = COMMON_NODE_HEADER_SIZE + LEAF_NODE_NUM_CELLS_SIZE
+	LEAF_NODE_NUM_CELLS_SIZE           = 4 // size of uint32
+	LEAF_NODE_NUM_CELLS_OFFSET         = COMMON_NODE_HEADER_SIZE
+	LEAF_NODE_NEXT_LEAF_POINTER_SIZE   = 4
+	LEAF_NODE_NEXT_LEAF_POINTER_OFFSET = LEAF_NODE_NUM_CELLS_OFFSET + LEAF_NODE_NUM_CELLS_SIZE
+	LEAF_NODE_HEADER_SIZE              = COMMON_NODE_HEADER_SIZE + LEAF_NODE_NUM_CELLS_SIZE + LEAF_NODE_NEXT_LEAF_POINTER_SIZE
 )
 
 // Leaf Node Body Layout
@@ -96,6 +98,14 @@ func SetLeafNodeNumCells(node []byte, numCells uint32) {
 	binary.LittleEndian.PutUint32(node[LEAF_NODE_NUM_CELLS_OFFSET:], numCells)
 }
 
+func LeafNodeNextLeaf(node []byte) uint32 {
+	return binary.LittleEndian.Uint32(node[LEAF_NODE_NEXT_LEAF_POINTER_OFFSET:])
+}
+
+func SetLeafNodeNextLeaf(node []byte, pageNum uint32) {
+	binary.LittleEndian.PutUint32(node[LEAF_NODE_NEXT_LEAF_POINTER_OFFSET:], pageNum)
+}
+
 func LeafNodeCell(node []byte, cellNum uint32) []byte {
 	offset := LEAF_NODE_HEADER_SIZE + cellNum*LEAF_NODE_CELL_SIZE
 	return node[offset : offset+LEAF_NODE_CELL_SIZE]
@@ -120,6 +130,7 @@ func InitializeLeafNode(node []byte) {
 	SetNodeType(node, NODE_LEAF)
 	SetNodeRoot(node, false)
 	SetLeafNodeNumCells(node, 0)
+	SetLeafNodeNextLeaf(node, 0) // 0 represents no sibling
 }
 
 func InternalNodeNumKeys(node []byte) uint32 {
