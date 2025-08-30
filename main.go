@@ -149,7 +149,7 @@ func tableFind(table *Table, key uint32) (*Cursor, error) {
 	if btree.GetNodeType(rootNode) == btree.NODE_LEAF {
 		return leafNodeFind(table, rootPageNum, key)
 	} else {
-		return nil, fmt.Errorf("TODO: Need to implement search an internel node")
+		return nil, fmt.Errorf("TODO: Need to implement search an internal node")
 	}
 }
 
@@ -322,26 +322,28 @@ func pagerOpen(filename string) (*Pager, error) {
 
 // dbOpen opens a database connection
 func dbOpen(filename string) (*Table, error) {
-	pager, err := pagerOpen(filename)
-	if err != nil {
-		return nil, err
-	}
+    pager, err := pagerOpen(filename)
+    if err != nil {
+        return nil, err
+    }
 
-	table := &Table{
-		Pager:       pager,
-		RootPageNum: 0,
-	}
+    table := &Table{
+        Pager:       pager,
+        RootPageNum: 0,
+    }
 
-	if pager.NumPages == 0 {
-		rootNode, err := pager.getPage(0)
-		if err != nil {
-			return nil, err
-		}
+    if pager.NumPages == 0 {
+        // New database file. Initialize page 0 as leaf node.
+        rootNode, err := pager.getPage(0)
+        if err != nil {
+            return nil, err
+        }
 
-		btree.InitializeLeafNode(rootNode)
-	}
+        btree.InitializeLeafNode(rootNode)
+        btree.SetNodeRoot(rootNode, true)
+    }
 
-	return table, nil
+    return table, nil
 }
 
 func (p *Pager) getPage(pageNum uint32) ([]byte, error) {
