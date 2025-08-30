@@ -127,8 +127,48 @@ func tableFind(table *Table, key uint32) (*Cursor, error) {
 	if btree.GetNodeType(rootNode) == btree.NODE_LEAF {
 		return leafNodeFind(table, rootPageNum, key)
 	} else {
-		return nil, fmt.Errorf("TODO: Need to implement search an internal node")
+		return internalNodeFind(table, rootPageNum, key)
 	}
+}
+
+func internalNodeFind(table *Table, pageNum uint32, key uint32) (*Cursor, error) {
+	node, err := table.Pager.getPage(pageNum)
+
+	if err != nil {
+		return nil, err
+	}
+
+	numKeys := btree.InternalNodeNumKeys(node)
+
+	minIdx := uint32(0)
+	maxIdx := numKeys
+
+	for minIdx != maxIdx {
+		idx := (minIdx + maxIdx) / 2
+		keyToRight := btree.InternalNodeKey(node, idx)
+		if keyToRight >= key {
+			maxIdx = idx
+		} else {
+			minIdx = idx + 1
+		}
+	}
+
+	childNum := btree.InternalNodeChild(node, minIdx)
+	child, err := table.Pager.getPage(childNum)
+
+	if err != nil {
+		return nil, err
+	}
+
+	// Recursively search the child
+    switch btree.GetNodeType(child) {
+    case btree.NODE_LEAF:
+        return leafNodeFind(table, childNum, key)
+    case btree.NODE_INTERNAL:
+        return internalNodeFind(table, childNum, key)
+    default:
+        return nil, fmt.Errorf("Unknown node type")
+    }
 }
 
 // getUnusedPageNum returns the next available page number
